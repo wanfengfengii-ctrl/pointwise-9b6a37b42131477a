@@ -17,6 +17,50 @@ SCHEMA = (
     'CREATE TABLE classification_runs(run_id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(task_id), symbols TEXT NOT NULL, bindings TEXT NOT NULL, result TEXT NOT NULL)',
 )
 
+# Added after v1; created on demand so existing v1 catalogs open unchanged.
+RISK_SCHEMA = (
+    'CREATE TABLE IF NOT EXISTS risk_runs(run_id INTEGER PRIMARY KEY REFERENCES classification_runs(run_id), task_id TEXT NOT NULL REFERENCES tasks(task_id), costs TEXT NOT NULL, result TEXT NOT NULL)',
+)
+
+
+def _pairs(values):
+    return [[key[0], key[1], str(value)] for key, value in values.items()]
+
+
+def _second_wire(second):
+    return {category: None if moments is None else _pairs(moments)
+            for category, moments in second.items()}
+
+
+def _coordinate_pairs(values):
+    return [[key[0][0], key[0][1], key[1][0], key[1][1], str(value)]
+            for key, value in values.items()]
+
+
+def risk_result_wire(classification, second, mean, covariance, cost_mean, cost_variance):
+    return {
+        'classification': result_wire(classification),
+        'second': _second_wire(second),
+        'mean': _pairs(mean),
+        'covariance': _coordinate_pairs(covariance),
+        'cost_mean': str(cost_mean),
+        'cost_variance': str(cost_variance),
+    }
+
+
+def risk_result_values(wire):
+    return {
+        'classification': result_values(wire['classification']),
+        'second': {category: None if rows is None else
+                   {(s, t): Fraction(v) for s, t, v in rows}
+                   for category, rows in wire['second'].items()},
+        'mean': {(c, s): Fraction(v) for c, s, v in wire['mean']},
+        'covariance': {((c1, s1), (c2, s2)): Fraction(v)
+                       for c1, s1, c2, s2, v in wire['covariance']},
+        'cost_mean': Fraction(wire['cost_mean']),
+        'cost_variance': Fraction(wire['cost_variance']),
+    }
+
 
 def result_wire(result):
     return {
@@ -170,6 +214,46 @@ class Catalog:
                  json.dumps(bindings, ensure_ascii=False),
                  json.dumps(result_wire(result), ensure_ascii=False, sort_keys=True)))
             return cursor.lastrowid
+
+    def _ensure_risk_schema(self):
+        for statement in RISK_SCHEMA:
+            self.db.execute(statement)
+
+    def record_risk(self, task_id, costs, payload, bindings, result):
+        """Publish a classification run and its linked risk row atomically."""
+        with self.atomic():
+            self._ensure_risk_schema()
+            cursor = self.db.execute(
+                'INSERT INTO classification_runs(task_id,symbols,bindings,result) VALUES (?,?,?,?)',
+                (task_id, json.dumps(list(payload), ensure_ascii=False),
+                 json.dumps(bindings, ensure_ascii=False),
+                 json.dumps(result_wire(result.classification), ensure_ascii=False,
+                            sort_keys=True)))
+            run_id = cursor.lastrowid
+            self.db.execute(
+                'INSERT INTO risk_runs(run_id,task_id,costs,result) VALUES (?,?,?,?)',
+                (run_id, task_id,
+                 json.dumps(_pairs(costs), ensure_ascii=False),
+                 json.dumps(risk_result_wire(
+                     result.classification, result.second, result.mean,
+                     result.covariance, result.cost_mean, result.cost_variance),
+                     ensure_ascii=False, sort_keys=True)))
+            return run_id
+
+    def risk_audits(self, task_id):
+        self.task(task_id)
+        present = self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='risk_runs'"
+        ).fetchone()
+        if not present:
+            return ()
+        return tuple({
+            'run_id': run_id,
+            'costs': {(c, s): Fraction(v) for c, s, v in json.loads(costs)},
+            'result': risk_result_values(json.loads(result)),
+        } for run_id, costs, result in self.db.execute(
+            'SELECT run_id,costs,result FROM risk_runs WHERE task_id=? ORDER BY run_id',
+            (task_id,)))
 
     def audits(self, task_id):
         self.task(task_id)

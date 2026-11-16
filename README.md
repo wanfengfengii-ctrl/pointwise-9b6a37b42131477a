@@ -9,6 +9,9 @@ python3.11 -B -m unittest discover -s tests -v
 python3.11 -B demo.py
 ```
 
+`verify.py`（`.pointwise-runtime.json` 的 verify 入口）运行全部原回归与新增风险回归，
+随后执行 `risk_examples.py --risk` 公开演示；`demo.py` 额外展示真实风险值与重开结果。
+
 无需安装依赖。测试和演示只在测试临时目录创建数据库。demo 构建完整旧库、分类、追加修订、建立新任务、关闭重开，并独立调用 SDK2 显式边端口。
 
 ## 模型与路径
@@ -78,6 +81,8 @@ Catalog.atomic(before_commit=None) 是现有通用事务设施：外层 BEGIN IM
 
 sdk1.load(payload) 返回不可变 Model；sdk1.evaluate(model, symbols) 返回 Execution(evidence, visits)。SDK1 精确求解静默循环，不截断路径。
 
+sdk1.evaluate_moments(model, symbols) 返回 Moments(evidence, visits, second)。evidence 与 visits 同 evaluate；正证据时 second[(s,t)] 是 E[N_s*N_t] 的条件二阶矩，覆盖全部有序原始状态对。实现用 (I-Q)^-1 精确静默闭包与逐输入位置的有标记状态演化，同一次访问的对角项单独补回，全部为 Fraction，无浮点或路径截断。零证据时 visits 和 second 为 None。接口细节与联合风险见 RISK.md。
+
 sdk2.load(payload) 使用相同显式模型字段，但拒绝所有 symbol=None 的边，不限制目标状态数。sdk2.evaluate(model, symbols) 返回 Execution(evidence, edge_counts)。edge_counts 对每个边 id 给出条件期望经过次数，包含零计数；零证据时为 None。空输入正证据时所有边计数为零。SDK2 不返回状态访问数，不提供静默消除、目录、迁移或审计身份映射。两个 SDK 只共享格式校验和有理数基础设施，SDK2 不调用 SDK1。
 
 samples.explicit_model() 是独立 SDK2 端口样例：输入 xx 的 evidence=1，stay、finish、tail 边期望分别为 3/4、3/4、1/2。samples.plain_model() 可被两代 SDK 直接读取：输入长度 k 时 evidence=(1/3)^k，SDK1 的 collector 访问期望=k+1，SDK2 的 read 边期望=k。它们是显式模型兼容样例。
@@ -89,3 +94,21 @@ samples.retry_model() 只有 collector 一个状态，初始和终止权重为 1
 完整旧库包含 retrying 的 1/2、1/4 两个重试修订，plain 模型及多状态 cycle 模型。frozen 任务固定 retrying 修订1，current 固定修订2，均与 plain 使用先验 1:2，并已有三条持久分类审计。frozen 输入 x 的类别概率为 2/3、1/3；current 输入 x 的概率为 8/17、9/17。
 
 tests/test_business.py 是完整原回归，包括手算例、独立全局有理线性方程参照、固定种子循环组合、SDK2 有限路径穷举、零证据、未知符号、固定修订、审计值隔离、真实触发器写入拒绝、嵌套事务、文件重开和失败重试。测试参照不调用生产执行器或生产线性求解器。
+
+## 新增风险能力与交接不变量
+
+RISK.md 定义的联合风险审计已实现，原接口、返回结构和旧测试字节不变。
+
+- 新增测试 `tests/test_risk.py`（21 项）与独立核账模块 `tests/moment_reference.py`。
+  `moment_reference` 在截断到二次的形式变量多项式环上对位置展开路径方程做测试专用高斯消元，
+  不导入 sdk1，也不使用生产求解器；其常数项为 evidence，一次项为访问均值，二次项导出
+  E[N_s(N_s-1)] 与 E[N_s N_t]。全部期望值来自该模块或直接手算。
+- 当前回归：原 `tests/test_business.py` 16 项 + `tests/test_risk.py` 21 项，共 37 项全部通过。
+- 交付不变量：`evaluate_moments` 与同输入 `evaluate` 的 evidence/visits 恒等；second 覆盖全部
+  有序原始状态对且按模型状态顺序两两排列；正证据零先验类别保留条件矩而不参与后验权重；
+  联合坐标以 (category,state) 为身份，同名状态跨类别互不相同；普通审计先写、风险审计后写，
+  二者处于同一事务，任一步失败或外层 before_commit 失败都回滚两条记录；`classify` 不写风险；
+  风险存储表在旧库上按需创建（`IF NOT EXISTS`），schema_version 仍为 "1"，旧运行不补算；
+  head 更新与重开只影响后续运行，历史快照按值隔离。
+- 核账覆盖：初始进入、跨状态交叉访问、静默自环、多状态静默循环、平行边、不可达状态、
+  零证据、零先验、同名状态、有符号与非法成本、固定修订、两类审计分别写入失败以及文件重开。
